@@ -7,6 +7,7 @@ import numpy as np
 
 from utils import draw, CLASSES
 from YOLOv8 import detectExecutor, myFunc
+from tracker import BYTETracker
 
 
 _CURRENT_DIR = Path(__file__).parent
@@ -29,15 +30,21 @@ CLASS_BIT_MASKS = {cls: 1 << bit for cls, bit in CLASS_BIT_MAPPING.items()}
 
 
 class VisionTracker:
-    def __init__(self, TPEs=3, callback=None):
+    def __init__(self, TPEs=3, external_callback=None):
+        self.external_callback = external_callback
         self.detector = detectExecutor(
-            det_model=DET_MODEL_PATH, TPEs=TPEs, func=myFunc, callback=callback
+            det_model=DET_MODEL_PATH,
+            TPEs=TPEs,
+            func=myFunc,
+            callback=self._on_det_and_track,
         )
         self.tracking = False
         self.target_id = None
         self.mask = 0xFFFFFFFF  # 默认所有类别开启
         self.TPEs = TPEs
         self.frame_cout = 0
+
+        self.tracker = BYTETracker()
 
     def set_tracking_mode(self, tracking: bool):
         """切换是否开启跟踪模式"""
@@ -108,6 +115,64 @@ class VisionTracker:
             online_cls.append(t.class_name)
 
         return online_tlwhs, online_ids, online_scores, online_cls
+
+    def _on_det_and_track(self, cur_frame, results):
+        """
+        只要检测完成，这个函数就会被执行一次：
+          - 做筛选
+          - 可选做跟踪
+          - 最终绘图或数据发送
+        """
+        # 1. 无检测时直接返回
+        raw_boxes = results.get("ltrb_boxes", [])
+        raw_ids = results.get("classes_id", [])
+        raw_scores = results.get("scores", [])
+        raw_names = [CLASSES[i] for i in raw_ids]
+
+        if len(raw_boxes) == 0:
+            self.external_callback(
+                {
+                    "frame": cur_frame,
+                    "boxes": [],
+                    "classes": [],
+                },
+                False,
+            )
+            return
+
+        # 2. 按你自己的逻辑做过滤
+        keep = self.filter_mask(raw_names)
+        boxes = self.filter_arrays(raw_boxes, keep)
+        ids = self.filter_arrays(raw_ids, keep)
+        scores = self.filter_arrays(raw_scores, keep)
+        names = self.filter_arrays(raw_names, keep)
+
+        # 3. 如果不跟踪，直接绘检测框
+        if not self.tracking:
+            out = draw(cur_frame, boxes, names, None)
+            self.external_callback(
+                {"frame": out, "boxes": boxes, "classes": names}, True
+            )
+            return
+
+        # 4. 用 ByteTrack 更新
+        frm = {"ltrb_boxes": boxes, "classes_id": ids, "scores": scores}
+        online_targets, ok = self.tracker.update(frm)
+        if not ok:
+            self.self.external_callback(cur_frame, [], [])
+            return
+
+        # 5. 拆解跟踪结果并绘图
+        tlwhs, track_ids, track_scores, track_cls = self.deconstruct_bytetrack_outputs(
+            online_targets
+        )
+        track_names = [CLASSES[c] for c in track_cls]
+        out = draw(cur_frame, tlwhs, track_names, track_ids, tracking=True)
+
+        # 6. 最后将结果推给下游
+        self.external_callback(
+            {"frame": out, "boxes": boxes, "classes": track_names}, True
+        )
 
     def detworking(self, img):
 

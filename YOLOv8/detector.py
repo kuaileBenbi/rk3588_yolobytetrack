@@ -68,9 +68,9 @@ class detectExecutor:
         内部回调，获取 future 结果并调用用户回调。
         """
         try:
-            result = fut.result()
+            cur_frame, results = fut.result()
             # 将结果传递给外部回调
-            self.callback(result)
+            self.callback(cur_frame, results)
         except Exception as e:
             # 这里也可以把异常通过 callback 传出去，或另行日志/处理
             print(f"[detectExecutor] 任务执行异常: {e}")
