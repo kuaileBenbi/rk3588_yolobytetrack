@@ -11,7 +11,7 @@ from tracker import BYTETracker
 
 
 _CURRENT_DIR = Path(__file__).parent
-DET_MODEL_PATH = _CURRENT_DIR / "rknnModel/yolov8s.rknn"
+DET_MODEL_PATH = _CURRENT_DIR / "rknnModel/yolov8n.rknn"
 
 TPEs = 3
 
@@ -37,6 +37,8 @@ class VisionTracker:
             num_workers=TPEs,
             func=myFunc,
             callback=self._on_det_and_track,
+            max_in_flight=TPEs,
+            drop_when_full=True,
         )
         self.tracking = False
         self.target_id = None
@@ -116,7 +118,7 @@ class VisionTracker:
 
         return online_tlwhs, online_ids, online_scores, online_cls
 
-    def _on_det_and_track(self, det_res):
+    def _on_det_and_track(self, det_res, frame_id):
         """
         只要检测完成，这个函数就会被执行一次：
           - 做筛选
@@ -138,6 +140,7 @@ class VisionTracker:
                     "classes": [],
                 },
                 False,
+                frame_id,
             )
             return
 
@@ -152,7 +155,7 @@ class VisionTracker:
         if not self.tracking:
             out = draw(cur_frame, boxes, names, None)
             self.external_callback(
-                {"frame": out, "boxes": boxes, "classes": names}, True
+                {"frame": out, "boxes": boxes, "classes": names}, True, frame_id
             )
             return
 
@@ -160,7 +163,15 @@ class VisionTracker:
         frm = {"ltrb_boxes": boxes, "classes_id": ids, "scores": scores}
         online_targets, ok = self.tracker.update(frm)
         if not ok:
-            self.self.external_callback(cur_frame, [], [])
+            self.self.external_callback(
+                {
+                    "frame": cur_frame,
+                    "boxes": [],
+                    "classes": [],
+                },
+                False,
+                frame_id,
+            )
             return
 
         # 5. 拆解跟踪结果并绘图
@@ -172,12 +183,12 @@ class VisionTracker:
 
         # 6. 最后将结果推给下游
         self.external_callback(
-            {"frame": out, "boxes": boxes, "classes": track_names}, True
+            {"frame": out, "boxes": boxes, "classes": track_names}, True, frame_id
         )
 
-    def detworking(self, img):
+    def detworking(self, img, frame_id):
 
-        self.detector.put(img)
+        self.detector.put(img, frame_id)
 
     def stop_detworking(self):
         try:

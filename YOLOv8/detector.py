@@ -1,4 +1,4 @@
-from multiprocessing import Pool, Process, current_process, shared_memory
+from multiprocessing import Pool, Process, Semaphore, current_process, shared_memory
 from queue import Empty, SimpleQueue
 import numpy as np
 from rknnlite.api import RKNNLite
@@ -58,6 +58,8 @@ class detectExecutor:
         dtype=np.uint8,
         core_ids=(0, 1, 2),
         callback=None,
+        max_in_flight: int = None,  # 上限：同时在跑的任务数
+        drop_when_full: bool = True,  # 队列满时是丢帧还是阻塞
     ):
         """
         Args:
@@ -72,6 +74,11 @@ class detectExecutor:
 
         self.dtype = dtype
         self.callback = callback
+        self.drop_when_full = drop_when_full
+
+        if max_in_flight is None:
+            max_in_flight = num_workers * 2
+        self.sema = Semaphore(max_in_flight)
 
         # Create the Pool; each worker runs init_rknn_worker once
         self.pool = Pool(
@@ -80,23 +87,45 @@ class detectExecutor:
             initargs=(det_model, core_ids, func),
         )
 
-    def put(self, frame: np.ndarray):
+    def put(self, frame: np.ndarray, frame_id: int):
         """
         Submit one frame to the worker pool for inference.
         The provided callback(res, frame) will be called in the main process
         as soon as inference finishes.
+
+        Submit one frame + its ID to the pool.
+        回调会收到 (res, frame, frame_id) 三个参数。
         """
 
+        # 尝试获取信号量：代表「一个新任务」要入列
+        acquired = self.sema.acquire(block=not self.drop_when_full)
+
+        if not acquired:
+            # 丢帧策略：如果拿不到，就直接返回
+            return
+
+            # 提交给 Pool，callback 里释放信号量
+
+        def _on_done(res, f=frame, fid=frame_id):
+            try:
+                if self.callback:
+                    self.callback(res, fid)
+            finally:
+                # 一定要在 callback 后释放信号量
+                self.sema.release()
+
+        self.pool.apply_async(_pool_task, args=(frame,), callback=_on_done)
+
         # Submit to Pool; wrap the user callback so it receives (res, frame)
-        if self.callback:
-            self.pool.apply_async(
-                _pool_task,
-                args=(frame,),
-                callback=self.callback,
-            )
-        else:
-            # If no callback provided, just fire-and-forget
-            self.pool.apply_async(_pool_task, args=(frame,))
+        # if self.callback:
+        #     self.pool.apply_async(
+        #         _pool_task,
+        #         args=(frame,),
+        #         callback=lambda res, fid=frame_id: self.callback(res, fid),
+        #     )
+        # else:
+        #     # If no callback provided, just fire-and-forget
+        #     self.pool.apply_async(_pool_task, args=(frame,))
 
     def release(self):
         """
