@@ -316,6 +316,11 @@ def myFunc(rknn_lite, IMG):
 
     # draw(IMG, ltrb_boxes, scores, classes_id)
 
+    outputs = None
+    del outputs
+    IMG2 = None
+    del IMG2
+
     return IMG, {
         "ltrb_boxes": ltrb_boxes,
         "classes_id": classes_id,

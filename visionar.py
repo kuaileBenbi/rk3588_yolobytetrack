@@ -34,7 +34,7 @@ class VisionTracker:
         self.external_callback = external_callback
         self.detector = detectExecutor(
             det_model=DET_MODEL_PATH,
-            TPEs=TPEs,
+            num_workers=TPEs,
             func=myFunc,
             callback=self._on_det_and_track,
         )
@@ -116,13 +116,14 @@ class VisionTracker:
 
         return online_tlwhs, online_ids, online_scores, online_cls
 
-    def _on_det_and_track(self, cur_frame, results):
+    def _on_det_and_track(self, det_res):
         """
         只要检测完成，这个函数就会被执行一次：
           - 做筛选
           - 可选做跟踪
           - 最终绘图或数据发送
         """
+        cur_frame, results = det_res
         # 1. 无检测时直接返回
         raw_boxes = results.get("ltrb_boxes", [])
         raw_ids = results.get("classes_id", [])
