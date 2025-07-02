@@ -1,84 +1,106 @@
-from queue import Empty
+from multiprocessing import Pool, Process, current_process, shared_memory
+from queue import Empty, SimpleQueue
+import numpy as np
 from rknnlite.api import RKNNLite
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 
 
-def initRKNN(rknnModel="rknnModel/yolov8n.rknn", id=0):
-    rknn_lite = RKNNLite()
-    ret = rknn_lite.load_rknn(rknnModel)
-    if ret != 0:
-        print("Load RKNN rknnModel failed")
-        exit(ret)
-    if id == 0:
-        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_0)
-    elif id == 1:
-        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_1)
-    elif id == 2:
-        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_2)
-    elif id == -1:
-        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
-    else:
-        ret = rknn_lite.init_runtime()
-    if ret != 0:
-        print("Init runtime environment failed")
-        exit(ret)
-    print(rknnModel, f"\t\tdetect on NPU-{id}")
-    return rknn_lite
+_rknn = None
+_worker_func = None
 
 
-def initRKNNs(rknnModel="rknnModel/yolov8n.rknn", TPEs=1):
-    rknn_list = []
-    for i in range(TPEs):
-        rknn_list.append(initRKNN(rknnModel, i % 3))
-    return rknn_list
+def init_rknn_worker(det_model: str, core_ids: tuple, func):
+    """
+    Pool initializer: runs once in each worker process.
+    - Loads the RKNN model into the worker.
+    - Initializes the runtime on a per-worker NPU core.
+    - Stores the user inference function.
+    """
+    global _rknn, _worker_func
+
+    # Determine this worker's index (1-based) and map to a core_id
+    idx = current_process()._identity[0] - 1
+    core_id = core_ids[idx % len(core_ids)]
+
+    # Load and initialize RKNN
+    rknn = RKNNLite()
+    if rknn.load_rknn(det_model) != 0:
+        raise RuntimeError(f"[Worker {idx}] Failed to load RKNN model '{det_model}'")
+    core_map = {
+        0: RKNNLite.NPU_CORE_0,
+        1: RKNNLite.NPU_CORE_1,
+        2: RKNNLite.NPU_CORE_2,
+        -1: RKNNLite.NPU_CORE_0_1_2,
+    }
+    if rknn.init_runtime(core_mask=core_map.get(core_id, RKNNLite.NPU_CORE_0)) != 0:
+        raise RuntimeError(
+            f"[Worker {idx}] Failed to init RKNN runtime on core {core_id}"
+        )
+
+    _rknn = rknn
+    _worker_func = func
+
+
+def _pool_task(frame: np.ndarray):
+    """
+    The actual inference task run in each worker process.
+    Expects that init_rknn_worker has set _rknn and _worker_func.
+    """
+    return _worker_func(_rknn, frame)
 
 
 class detectExecutor:
-    def __init__(self, det_model, TPEs, func, callback):
+    def __init__(
+        self,
+        det_model: str,
+        func,
+        num_workers: int = 3,
+        dtype=np.uint8,
+        core_ids=(0, 1, 2),
+        callback=None,
+    ):
         """
-        det_model: 模型路径或对象
-        TPEs: 并行实例数
-        func: 検測函数，签名 func(rknn_instance, frame) -> result
-        callback: 结果回调，签名 callback(result: Any)
+        Args:
+            det_model: Path to .rknn model file.
+            func:      Inference function signature func(rknn, frame)->res.
+            num_workers: Number of parallel worker processes.
+            frame_shape:  Expected shape of each input frame (for validation).
+            dtype:        dtype of the frame numpy array.
+            core_ids:     Tuple of core IDs to round-robin assign to workers.
+            callback:     Callable(res, frame) invoked in main process.
         """
-        self.TPEs = TPEs
-        self.func = func
+
+        self.dtype = dtype
         self.callback = callback
 
-        # 初始化 RKNN 实例池和线程池
-        self.rknnPool = initRKNNs(det_model, TPEs)
-        self.pool = ThreadPoolExecutor(max_workers=TPEs)
-        self._round_robin = 0
+        # Create the Pool; each worker runs init_rknn_worker once
+        self.pool = Pool(
+            processes=num_workers,
+            initializer=init_rknn_worker,
+            initargs=(det_model, core_ids, func),
+        )
 
-    def put(self, frame):
+    def put(self, frame: np.ndarray):
         """
-        提交一个检测任务，计算完成后自动触发 callback(result)。
+        Submit one frame to the worker pool for inference.
+        The provided callback(res, frame) will be called in the main process
+        as soon as inference finishes.
         """
-        idx = self._round_robin
-        rknn_ins = self.rknnPool[idx]
-        self._round_robin = (idx + 1) % self.TPEs
 
-        fut = self.pool.submit(self.func, rknn_ins, frame)
-        # 给 future 添加回调
-        fut.add_done_callback(self._on_done)
-
-    def _on_done(self, fut):
-        """
-        内部回调，获取 future 结果并调用用户回调。
-        """
-        try:
-            cur_frame, results = fut.result()
-            # 将结果传递给外部回调
-            self.callback(cur_frame, results)
-        except Exception as e:
-            # 这里也可以把异常通过 callback 传出去，或另行日志/处理
-            print(f"[detectExecutor] 任务执行异常: {e}")
+        # Submit to Pool; wrap the user callback so it receives (res, frame)
+        if self.callback:
+            self.pool.apply_async(
+                _pool_task,
+                args=(frame,),
+                callback=self.callback,
+            )
+        else:
+            # If no callback provided, just fire-and-forget
+            self.pool.apply_async(_pool_task, args=(frame,))
 
     def release(self):
         """
-        关停线程池和释放 RKNN 资源
+        Gracefully shut down the Pool and wait for all tasks to complete.
         """
-        self.pool.shutdown(wait=True)
-        for inst in self.rknnPool:
-            inst.release()
+        self.pool.close()
+        self.pool.join()
